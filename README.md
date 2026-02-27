@@ -12,7 +12,7 @@ A compact, ultra‑low‑power display provides immediate insight into who has r
 When operating portable, constantly unlocking a smartphone drains battery and breaks focus.  
 ham-pocket-reporter serves as a dedicated status companion for your radio setup, offering a minimal distraction approach while still giving you real‑time spot information.
 
-![display](display.jpg)
+![display](media/display.jpg)
 ---
 
 ## 📡 How It Works
