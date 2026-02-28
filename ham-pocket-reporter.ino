@@ -7,7 +7,7 @@
  * ----------------------------------------------------------------------------
  */
 
-#include "config.h"               // TRACK_CALL, TEXT_SCALE, wifiList[]
+#include "config.h"               // TRACK_CALL, TEXT_SCALE, wifiList[], HISTORY_LINES
 #include <GxEPD2_BW.h>            // E-paper display driver
 #include <WiFi.h>
 #include <PubSubClient.h>
@@ -72,9 +72,12 @@ static const char* PREF_KEY = "last_ssid";
 // ========================= DISPLAY RUNTIME STATE =============================
 // ============================================================================
 
-#define LINES_HISTORY 6
+// Active number of history lines (computed at runtime: fixed or auto-fit)
+static uint8_t linesHistory = 6;  // set in setup()
 
-static String lines[LINES_HISTORY];   // Recent spot lines (scrolling)
+// Fixed-size buffer; we only use [0..linesHistory-1]
+static String lines[MAX_LINES_HISTORY];
+
 static String bestDistLine = "";      // Best distance formatted line
 static String bestSnrLine  = "";      // Best SNR formatted line
 
@@ -90,8 +93,73 @@ String headerLine = "UTC   BAND  MODE  SNR   LOC  DIST  ISO  RX";
 
 inline uint8_t  charW() { return 6 * TEXT_SCALE; }
 inline uint8_t  charH() { return 8 * TEXT_SCALE; }
-inline uint16_t LINE_STEP() { return charH() + 2; }
-inline uint16_t TOP_Y() { return charH() + 2; }
+inline uint16_t LINE_STEP() { return charH() + 2; }  // 1 text row height incl. 2px spacing
+
+// ----- Layout & spacing in PIXELS (supports "half-line" distances) -----
+inline uint16_t rowHeightPx() { return LINE_STEP(); } // one text row height
+
+// -------- Fine-grained spacing presets (scale with TEXT_SCALE) --------
+#define PAD_NONE    0
+#define PAD_QTR     (rowHeightPx() / 4)                  // quarter-line
+#define PAD_HALF    (rowHeightPx() / 2)                  // half-line
+#define PAD_3QTR    ((rowHeightPx() * 3) / 4)            // three-quarter line
+#define PAD_FULL    (rowHeightPx())                      // full line
+
+// -------- Global top margin over everything --------
+#ifndef TOP_MARGIN_PX
+  #define TOP_MARGIN_PX PAD_HALF                         // smaller top margin
+#endif
+
+// -------- Status area padding & separator --------
+#ifndef STATUS_TOP_PADDING_PX
+  #define STATUS_TOP_PADDING_PX PAD_HALF                 // space above status line
+#endif
+#ifndef STATUS_SEPARATOR_ENABLE
+  #define STATUS_SEPARATOR_ENABLE 0                      // 1 = draw separator line
+#endif
+#ifndef STATUS_SEPARATOR_THICKNESS
+  #define STATUS_SEPARATOR_THICKNESS 0                   // hairline thickness
+#endif
+#ifndef STATUS_SEPARATOR_INSET_PX
+  #define STATUS_SEPARATOR_INSET_PX 0                    // left/right inset
+#endif
+
+// -------- Header (table title) fine paddings --------
+#ifndef HEADER_TOP_PADDING_PX
+  #define HEADER_TOP_PADDING_PX PAD_NONE                  // padding above header
+#endif
+#ifndef HEADER_BOTTOM_PADDING_PX
+  #define HEADER_BOTTOM_PADDING_PX PAD_QTR              // padding below header
+#endif
+#ifndef HEADER_SEPARATOR_ENABLE
+  #define HEADER_SEPARATOR_ENABLE 0                      // 1 = draw separator below header
+#endif
+#ifndef HEADER_SEPARATOR_THICKNESS
+  #define HEADER_SEPARATOR_THICKNESS 1
+#endif
+#ifndef HEADER_SEPARATOR_INSET_PX
+  #define HEADER_SEPARATOR_INSET_PX 0
+#endif
+
+// -------- Best-block fine paddings --------
+#ifndef BEST_BLOCK_TOP_PADDING_PX
+  #define BEST_BLOCK_TOP_PADDING_PX PAD_HALF             // space before BEST title
+#endif
+#ifndef BEST_TITLE_BOTTOM_PADDING_PX
+  #define BEST_TITLE_BOTTOM_PADDING_PX PAD_QTR           // space under BEST title
+#endif
+#ifndef BEST_LINES_GAP_PX
+  #define BEST_LINES_GAP_PX PAD_NONE                     // space between best lines
+#endif
+#ifndef BEST_BLOCK_SEPARATOR_ENABLE
+  #define BEST_BLOCK_SEPARATOR_ENABLE 0                  // 1 = draw separator above best block
+#endif
+#ifndef BEST_BLOCK_SEPARATOR_THICKNESS
+  #define BEST_BLOCK_SEPARATOR_THICKNESS 0
+#endif
+#ifndef BEST_BLOCK_SEPARATOR_INSET_PX
+  #define BEST_BLOCK_SEPARATOR_INSET_PX 0
+#endif
 
 
 // ============================================================================
@@ -336,14 +404,71 @@ void showSplash() {
 
 
 // ============================================================================
+// ============ AUTO-FIT COMPUTATION FOR HISTORY LINES (PIXEL-BASED) ==========
+// ============================================================================
+
+// Compute how many history rows fit between the header area and the best-block,
+// while respecting the reserved status area at the bottom.
+// Returns clamped value between 1 and MAX_LINES_HISTORY.
+uint8_t computeAutoHistoryLines() {
+  // screen metrics
+  const uint16_t scrH = display.height();
+
+  const uint16_t rowH        = rowHeightPx();
+  const uint16_t topMarginPx = TOP_MARGIN_PX;
+  const uint16_t statusPadPx = STATUS_TOP_PADDING_PX;
+
+  // Bottom status text baseline sits at (scrH - charH()).
+  const uint16_t yBottom       = scrH - charH();
+  const uint16_t statusAreaTop = (uint16_t)(yBottom - statusPadPx);
+
+  // Start below top margin
+  uint16_t y = topMarginPx;
+
+  // Header block height:
+  y += HEADER_TOP_PADDING_PX;
+  y += rowH; // header text row
+  y += HEADER_BOTTOM_PADDING_PX;
+
+#if HEADER_SEPARATOR_ENABLE
+  // separator right below the header
+  y += HEADER_SEPARATOR_THICKNESS;
+#endif
+
+  // Best block required height (we must keep this space free at the bottom of the usable area)
+  const uint16_t bestBlockRequired =
+    BEST_BLOCK_TOP_PADDING_PX
+    + rowH                        // best title
+    + BEST_TITLE_BOTTOM_PADDING_PX
+    + rowH                        // bestDistLine
+    + BEST_LINES_GAP_PX
+    + rowH;                       // bestSnrLine
+
+  const uint16_t usableHeight = (statusAreaTop > bestBlockRequired)
+                              ? (statusAreaTop - bestBlockRequired)
+                              : 0;
+
+  if (usableHeight <= y) return 1;  // ensure at least 1 row
+  uint16_t freePx = usableHeight - y;
+  uint8_t possibleRows = (uint8_t)(freePx / rowH);
+
+  if (possibleRows < 1) possibleRows = 1;
+  if (possibleRows > MAX_LINES_HISTORY) possibleRows = MAX_LINES_HISTORY;
+  return possibleRows;
+}
+
+
+// ============================================================================
 // ======================= RENDER ENTIRE SCREEN (PARTIAL) ======================
 // ============================================================================
 //
 // Draws:
-//  1) Header
-//  2) Spot history
-//  3) Best distance / Best SNR
-//  4) Bottom status bar (WiFi | MQTT)
+//  (A) Table header
+//  (B) History list
+//  (C) Best distance / Best SNR
+//  (D) Optional separator above status
+//  (E) Bottom status bar (WiFi | MQTT)
+//  Layout uses pixel-based spacing (supports half-line gaps).
 //
 
 void renderContentPartial() {
@@ -357,44 +482,103 @@ void renderContentPartial() {
     display.fillRect(0, 0, display.width(), display.height(), GxEPD_WHITE);
     display.setTextColor(GxEPD_BLACK);
 
-    uint16_t y = TOP_Y();
+    const uint16_t rowH        = rowHeightPx();
+    const uint16_t topMarginPx = TOP_MARGIN_PX;
+    const uint16_t statusPadPx = STATUS_TOP_PADDING_PX;
 
-    // 1) Header
+    // Bottom status text baseline (last text row)
+    const uint16_t yBottom = display.height() - charH();
+
+    // Top boundary of status area (padding sits above the status text baseline)
+    const uint16_t statusAreaTop = (uint16_t)(yBottom - statusPadPx);
+
+    // Main content may not cross into status area
+    const uint16_t usableHeight = statusAreaTop;
+
+    uint16_t y = topMarginPx;
+
+    // ---- (A) TABLE HEADER (column labels) ----
+    y += HEADER_TOP_PADDING_PX;                    // fine padding above header
     display.setCursor(0, y);
     display.print(headerLine);
-    y += LINE_STEP();
+    y += rowH;                                     // header row height
+    y += HEADER_BOTTOM_PADDING_PX;                 // fine padding below header
 
-    // 2) History lines
-    for (int i = 0; i < LINES_HISTORY; i++) {
+#if HEADER_SEPARATOR_ENABLE
+    {
+      // draw hairline separator right below the header block
+      uint16_t sepY = (y > HEADER_SEPARATOR_THICKNESS) ? (y - 1) : y;
+      uint16_t sepX = HEADER_SEPARATOR_INSET_PX;
+      uint16_t sepW = display.width() - (2 * HEADER_SEPARATOR_INSET_PX);
+      if (sepW > 0) {
+        display.fillRect(sepX, sepY, sepW, HEADER_SEPARATOR_THICKNESS, GxEPD_BLACK);
+      }
+    }
+#endif
+
+    // ---- (B) HISTORY LIST ----
+    for (int i = 0; i < linesHistory; i++) {
+      if (y + rowH > usableHeight) break;         // avoid overlapping status area
       display.setCursor(0, y);
       display.print(lines[i]);
-      y += LINE_STEP();
+      y += rowH;
     }
 
-    // Extra spacing
-    y += LINE_STEP();
+    // ---- Optional separator or fine padding before BEST block ----
+#if BEST_BLOCK_SEPARATOR_ENABLE
+    {
+      uint16_t sepY = (y + BEST_BLOCK_TOP_PADDING_PX > BEST_BLOCK_SEPARATOR_THICKNESS)
+                      ? (y + BEST_BLOCK_TOP_PADDING_PX - 1)
+                      : (y);
+      uint16_t sepX = BEST_BLOCK_SEPARATOR_INSET_PX;
+      uint16_t sepW = display.width() - (2 * BEST_BLOCK_SEPARATOR_INSET_PX);
+      if (sepW > 0 && sepY < usableHeight) {
+        display.fillRect(sepX, sepY, sepW, BEST_BLOCK_SEPARATOR_THICKNESS, GxEPD_BLACK);
+      }
+    }
+#endif
+    y += BEST_BLOCK_TOP_PADDING_PX;               // fine padding before BEST title
 
-    // 3) Best stats header
-    display.setCursor(0, y);
-    display.print("BEST DIST / SNR");
-    y += LINE_STEP();
+    // ---- (C) BEST BLOCK ----
+    if (y + rowH <= usableHeight) {
+      display.setCursor(0, y);
+      display.print("BEST DIST / SNR");
+      y += rowH;
+      y += BEST_TITLE_BOTTOM_PADDING_PX;          // fine padding below title
+    }
 
-    // Best distance
-    display.setCursor(0, y);
-    display.print(bestDistLine);
-    y += LINE_STEP();
+    if (y + rowH <= usableHeight) {
+      display.setCursor(0, y);
+      display.print(bestDistLine);
+      y += rowH;
+    }
 
-    // Best SNR
-    display.setCursor(0, y);
-    display.print(bestSnrLine);
+    y += BEST_LINES_GAP_PX;                       // fine gap between best lines
 
-    // 4) Bottom status bar (always last line of the screen)
+    if (y + rowH <= usableHeight) {
+      display.setCursor(0, y);
+      display.print(bestSnrLine);
+    }
+
+    // ---- (D) Optional separator above status area ----
+#if STATUS_SEPARATOR_ENABLE
+    {
+      uint16_t sepY = (statusAreaTop > STATUS_SEPARATOR_THICKNESS)
+                      ? (statusAreaTop - STATUS_SEPARATOR_THICKNESS) : 0;
+      uint16_t sepX = STATUS_SEPARATOR_INSET_PX;
+      uint16_t sepW = display.width() - (2 * STATUS_SEPARATOR_INSET_PX);
+      if (sepW > 0) {
+        display.fillRect(sepX, sepY, sepW, STATUS_SEPARATOR_THICKNESS, GxEPD_BLACK);
+      }
+    }
+#endif
+
+    // ---- (E) STATUS BAR (always last line) ----
     {
       String st = buildStatusLine();
       uint16_t maxChars = display.width() / charW();
       if (st.length() > maxChars) st.remove(maxChars);
 
-      uint16_t yBottom = display.height() - (charH());
       display.setCursor(0, yBottom);
       display.print(st);
     }
@@ -409,7 +593,7 @@ void renderContentPartial() {
 
 void setupWiFiBasics() {
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);  // still helpful when AP temporarily drops
+  WiFi.setAutoReconnect(true);  // helpful when AP temporarily drops
   WiFi.persistent(false);       // do not write creds to flash on begin()
 }
 
@@ -504,7 +688,9 @@ bool ensureWiFi(uint32_t timeoutMs = 15000) {
   delay(200);
 
   // Fast path: last used SSID (≈40% of total timeout, capped to 6s)
-  const uint32_t fastTryMs = (timeoutMs * 2 / 5 < 6000) ? (timeoutMs * 2 / 5) : 6000;
+  uint32_t fastTryMs = (timeoutMs * 2 / 5);
+  if (fastTryMs > 6000) fastTryMs = 6000;
+
   int lastIdx = loadLastUsedWifi();
   if (lastIdx >= 0) {
     setWifiStatus("WiFi: trying last SSID " + String(wifiList[lastIdx].ssid));
@@ -641,8 +827,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     ctry4.c_str(), receiverCall
   );
 
-  // Scroll history
-  for (int i=LINES_HISTORY-1; i>0; i--)
+  // Scroll history in fixed buffer size, limited by linesHistory
+  for (int i = (int)linesHistory - 1; i > 0; i--)
     lines[i] = lines[i-1];
   lines[0] = line;
 
@@ -687,8 +873,18 @@ void setup() {
   display.firstPage();
   do { display.fillScreen(GxEPD_WHITE); } while (display.nextPage());
 
-  // Reset buffers
-  for (int i=0; i<LINES_HISTORY; i++) lines[i] = "";
+  // Decide how many history rows to use: fixed from config or auto-fit
+  if (HISTORY_LINES > 0) {
+    linesHistory = (HISTORY_LINES > MAX_LINES_HISTORY)
+                   ? MAX_LINES_HISTORY
+                   : (uint8_t)HISTORY_LINES;
+  } else {
+    // Auto-fit based on current layout and screen size
+    linesHistory = computeAutoHistoryLines();
+  }
+
+  // Reset buffers (full buffer to be safe)
+  for (int i = 0; i < MAX_LINES_HISTORY; i++) lines[i] = "";
   bestDistLine = "";
   bestSnrLine  = "";
 

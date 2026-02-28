@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 ## [2026-02-28]
 ### Added
 - Status bar displaying **Wi‑Fi status** and **MQTT status**.
+- Fix display paddings
 
 ## [2026-02-27]
 ### Added
