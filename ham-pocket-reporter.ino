@@ -8,7 +8,7 @@
  */
 
 #include "config.h"               // TRACK_CALL, TEXT_SCALE, wifiList[]
-#include <GxEPD2_BW.h>            // E‑paper display driver
+#include <GxEPD2_BW.h>            // E-paper display driver
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -92,6 +92,32 @@ inline uint8_t  charW() { return 6 * TEXT_SCALE; }
 inline uint8_t  charH() { return 8 * TEXT_SCALE; }
 inline uint16_t LINE_STEP() { return charH() + 2; }
 inline uint16_t TOP_Y() { return charH() + 2; }
+
+
+// ============================================================================
+// ============================ STATUS LINE STATE ==============================
+// ============================================================================
+//
+// A bottom status bar displaying WiFi and MQTT states.
+//
+
+static String wifiStatus = "";      // e.g., "WiFi: scanning...", "WiFi: SSID (-62 dBm)"
+static String mqttStatus = "";      // e.g., "MQTT: reconnecting...", "MQTT: OK"
+static bool   statusDirty = false;  // set true to trigger a partial redraw
+
+inline void setWifiStatus(const String& s)  { if (wifiStatus != s) { wifiStatus = s; statusDirty = true; } }
+inline void setMqttStatus(const String& s)  { if (mqttStatus != s) { mqttStatus = s; statusDirty = true; } }
+
+// Build combined status string: "WiFi: ... | MQTT: ..."
+String buildStatusLine() {
+  String s;
+  if (wifiStatus.length()) s += wifiStatus;
+  if (mqttStatus.length()) {
+    if (s.length()) s += " | ";
+    s += mqttStatus;
+  }
+  return s;
+}
 
 
 // ============================================================================
@@ -312,6 +338,13 @@ void showSplash() {
 // ============================================================================
 // ======================= RENDER ENTIRE SCREEN (PARTIAL) ======================
 // ============================================================================
+//
+// Draws:
+//  1) Header
+//  2) Spot history
+//  3) Best distance / Best SNR
+//  4) Bottom status bar (WiFi | MQTT)
+//
 
 void renderContentPartial() {
   display.setRotation(1);
@@ -338,6 +371,7 @@ void renderContentPartial() {
       y += LINE_STEP();
     }
 
+    // Extra spacing
     y += LINE_STEP();
 
     // 3) Best stats header
@@ -345,14 +379,25 @@ void renderContentPartial() {
     display.print("BEST DIST / SNR");
     y += LINE_STEP();
 
-    // 4) Best distance
+    // Best distance
     display.setCursor(0, y);
     display.print(bestDistLine);
     y += LINE_STEP();
 
-    // 5) Best SNR
+    // Best SNR
     display.setCursor(0, y);
     display.print(bestSnrLine);
+
+    // 4) Bottom status bar (always last line of the screen)
+    {
+      String st = buildStatusLine();
+      uint16_t maxChars = display.width() / charW();
+      if (st.length() > maxChars) st.remove(maxChars);
+
+      uint16_t yBottom = display.height() - (charH());
+      display.setCursor(0, yBottom);
+      display.print(st);
+    }
 
   } while (display.nextPage());
 }
@@ -364,7 +409,7 @@ void renderContentPartial() {
 
 void setupWiFiBasics() {
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);  // still useful when AP temporarily drops
+  WiFi.setAutoReconnect(true);  // still helpful when AP temporarily drops
   WiFi.persistent(false);       // do not write creds to flash on begin()
 }
 
@@ -393,31 +438,31 @@ void saveLastUsedWifi(const char* ssid) {
 
 // Try to connect to a specific WiFi entry; return true on success
 bool connectToEntry(const WifiEntry& e, uint32_t timeoutMs) {
-  Serial.printf("Connecting to SSID: %s\n", e.ssid);
+  setWifiStatus("WiFi: connecting " + String(e.ssid));
 
   WiFi.begin(e.ssid, e.password);
 
   uint32_t start = millis();
   while (millis() - start < timeoutMs) {
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("Connected to %s, IP: %s\n",
-        e.ssid, WiFi.localIP().toString().c_str());
+      int rssi = WiFi.RSSI();
+      setWifiStatus("WiFi: " + String(e.ssid) + " (" + String(rssi) + " dBm)");
       saveLastUsedWifi(e.ssid);
       return true;
     }
     delay(250);
   }
-  Serial.println("Connection attempt timed out.");
+  setWifiStatus("WiFi: connect timeout");
   return false;
 }
 
 // Scan for known networks; connect to the strongest one
 bool connectBestKnown(uint32_t timeoutMs) {
-  Serial.println("Scanning for WiFi...");
-  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/false);
+  setWifiStatus("WiFi: scanning...");
 
+  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/false);
   if (n <= 0) {
-    Serial.println("No networks found.");
+    setWifiStatus("WiFi: no networks found");
     return false;
   }
 
@@ -429,21 +474,19 @@ bool connectBestKnown(uint32_t timeoutMs) {
     int rssi = WiFi.RSSI(i);
 
     int idx = findWifiIndexBySsid(ssidScan);
-    if (idx >= 0) {
-      if (rssi > bestRSSI) {
-        bestRSSI = rssi;
-        bestIdxInList = idx;
-      }
+    if (idx >= 0 && rssi > bestRSSI) {
+      bestRSSI = rssi;
+      bestIdxInList = idx;
     }
   }
 
   if (bestIdxInList < 0) {
-    Serial.println("No known SSIDs found in scan results.");
+    setWifiStatus("WiFi: known SSIDs not found");
     return false;
   }
 
-  Serial.printf("Best known SSID: %s (RSSI: %d)\n",
-                wifiList[bestIdxInList].ssid, bestRSSI);
+  setWifiStatus("WiFi: connecting " + String(wifiList[bestIdxInList].ssid) +
+                " (" + String(bestRSSI) + " dBm)");
 
   return connectToEntry(wifiList[bestIdxInList], timeoutMs);
 }
@@ -456,17 +499,18 @@ bool connectBestKnown(uint32_t timeoutMs) {
 bool ensureWiFi(uint32_t timeoutMs = 15000) {
   if (WiFi.status() == WL_CONNECTED) return true;
 
+  setWifiStatus("WiFi: reconnecting...");
   WiFi.disconnect(true, true);
   delay(200);
 
   // Fast path: last used SSID (≈40% of total timeout, capped to 6s)
-  const uint32_t fastTryMs = min<uint32_t>(timeoutMs * 2 / 5, 6000);
+  const uint32_t fastTryMs = (timeoutMs * 2 / 5 < 6000) ? (timeoutMs * 2 / 5) : 6000;
   int lastIdx = loadLastUsedWifi();
   if (lastIdx >= 0) {
-    Serial.printf("Trying last SSID from NVS: %s\n", wifiList[lastIdx].ssid);
+    setWifiStatus("WiFi: trying last SSID " + String(wifiList[lastIdx].ssid));
     if (connectToEntry(wifiList[lastIdx], fastTryMs)) return true;
   } else {
-    Serial.println("No last SSID in NVS or not in wifiList.");
+    setWifiStatus("WiFi: no last SSID; scanning...");
   }
 
   // Fallback: scan & connect to strongest known SSID
@@ -503,18 +547,24 @@ void reconnectMQTT() {
   if (millis() < nextTry) return;
 
   if (!ensureWiFi(15000)) {
-    nextTry = millis() + (2000UL << min<uint8_t>(fails, 4));
+    setMqttStatus("MQTT: waiting for WiFi…");
+    uint8_t shift = (fails > 4) ? 4 : fails;
+    nextTry = millis() + (2000UL << shift);
     fails++;
     return;
   }
 
+  setMqttStatus("MQTT: reconnecting…");
   if (connectMQTTOnce()) {
+    setMqttStatus("MQTT: OK");
     fails = 0;
     nextTry = millis() + 5000;
     return;
   }
 
-  nextTry = millis() + (2000UL << min<uint8_t>(fails, 4));
+  setMqttStatus("MQTT: retrying…");
+  uint8_t shift = (fails > 4) ? 4 : fails;
+  nextTry = millis() + (2000UL << shift);
   fails++;
 }
 
@@ -642,6 +692,9 @@ void setup() {
   bestDistLine = "";
   bestSnrLine  = "";
 
+  // Initial status
+  setWifiStatus("WiFi: boot...");
+  setMqttStatus("MQTT: idle");
   renderContentPartial();
 
   // Build PSKReporter MQTT topic with callsign filter
@@ -674,13 +727,28 @@ void loop() {
   // Keep WiFi alive / reconnect if needed (tries last SSID, then best known)
   if (WiFi.status() != WL_CONNECTED) {
     ensureWiFi(15000);
-    delay(100); // avoid tight loop
+    // ensureWiFi() updates WiFi status strings
+  } else {
+    // Optional: refresh WiFi status occasionally to reflect current RSSI
+    static unsigned long nextWiFiStatus = 0;
+    if (millis() > nextWiFiStatus) {
+      setWifiStatus("WiFi: " + WiFi.SSID() + " (" + String(WiFi.RSSI()) + " dBm)");
+      nextWiFiStatus = millis() + 15000; // update every 15s
+    }
   }
 
-  // Maintain MQTT
+  // If status changed, re-render bottom line (and all content) using partial update
+  if (statusDirty) {
+    statusDirty = false;
+    renderContentPartial();
+  }
+
+  // Maintain MQTT connection
   if (!client.connected()) {
     reconnectMQTT();
   } else {
     client.loop();
   }
+
+  delay(50); // keep loop gentle
 }
